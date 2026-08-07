@@ -8,7 +8,7 @@ RESET=$(tput sgr0)
 
 echo -e "${CYAN}"
 echo "===================================="
-echo "         GitHub: Netplas"
+echo "          GitHub: Netplas"
 echo "   Secure Obfuscated Tunnel Script"
 echo "===================================="
 echo -e "${RESET}"
@@ -16,17 +16,22 @@ echo -e "${RESET}"
 # بررسی نصب بودن ابزارهای ضروری
 if ! command -v wg &> /dev/null || ! command -v iptables &> /dev/null; then
     echo "[*] Installing WireGuard and iptables..."
-    apt-get update && apt-get install -y wireguard iptables wget
+    apt-get update && apt-get install -y wireguard iptables wget tar
 fi
 
-# نصب خودکار ابزار Gost در صورت عدم حضور
+# نصب خودکار ابزار Gost (نسخه پایدار جدید)
 if [ ! -f /usr/local/bin/gost ]; then
     echo "[*] Downloading and installing Gost..."
-    wget -q -O /tmp/gost.tar.gz https://github.com/go-gost/gost/releases/download/v3.0.0-rc.8/gost_3.0.0-rc.8_linux_amd64.tar.gz
+    wget -q -O /tmp/gost.tar.gz https://github.com/go-gost/gost/releases/download/v3.2.6/gost_3.2.6_linux_amd64.tar.gz
     tar -xzf /tmp/gost.tar.gz -C /tmp/
-    mv /tmp/gost /usr/local/bin/
+    # در نسخه جدید ممکن است نام فایل خروجی gost باشد
+    if [ -f /tmp/gost ]; then
+        mv /tmp/gost /usr/local/bin/
+    elif [ -f /tmp/gost_*_linux_amd64/gost ]; then
+        mv /tmp/gost_*_linux_amd64/gost /usr/local/bin/
+    fi
     chmod +x /usr/local/bin/gost
-    rm -f /tmp/gost.tar.gz
+    rm -rf /tmp/gost.tar.gz /tmp/gost_*
 fi
 
 echo "Select an option:"
@@ -42,7 +47,7 @@ if [[ "$LOCATION" == "3" ]]; then
     systemctl daemon-reload
     ip link set wg0 down 2>/dev/null
     ip link del wg0 2>/dev/null
-    rm -rf /etc/wireguard
+    rm -rf /etc/wireguard /usr/local/bin/gost
     iptables -F
     iptables -X
     iptables -t nat -F
@@ -83,18 +88,17 @@ if [[ "$LOCATION" == "1" ]]; then
 
     sysctl -w net.ipv4.ip_forward=1 > /dev/null
 
-    # ساخت اینترفیس وایرگارد (ارتباط لوکال روی پورت داخلی)
+    # ساخت اینترفیس وایرگارد
     ip link add dev wg0 type wireguard
-    ip address add 10.0.0.2/30 devwg0 2>/dev/null || ip address add 10.0.0.2/30 dev wg0
+    ip address add 10.0.0.2/30 dev wg0 2>/dev/null
     mkdir -p /etc/wireguard
     echo "$PrivKey" > /etc/wireguard/private.key
     
-    # وایرگارد به جای IP مستقیم، به پورت لوکال gost وصل می‌شود
     wg set wg0 listen-port $((WG_PORT + 1)) private-key /etc/wireguard/private.key
     wg set wg0 peer "$FOREIGN_PUBKEY" endpoint "127.0.0.1:$((WG_PORT + 1))" allowed-ips 0.0.0.0/0 persistent-keepalive 25
     ip link set dev wg0 up
 
-    # ساخت سرویس Gost برای رمزنگاری و ارسال تانل به سرور خارج روی پورت دلخواه
+    # ساخت سرویس Gost برای ایران
     cat << EOF > /etc/systemd/system/gost-tunnel.service
 [Unit]
 Description=Gost Tunnel Client for Iran
@@ -138,7 +142,7 @@ elif [[ "$LOCATION" == "2" ]]; then
 
     # ساخت اینترفیس وایرگارد سرور خارج
     ip link add dev wg0 type wireguard
-    ip address add 10.0.0.1/30 dev wg0
+    ip address add 10.0.0.1/30 dev wg0 2>/dev/null
     mkdir -p /etc/wireguard
     echo "$PrivKey" > /etc/wireguard/private.key
     
@@ -146,7 +150,7 @@ elif [[ "$LOCATION" == "2" ]]; then
     wg set wg0 peer "$IRAN_PUBKEY" endpoint "127.0.0.1:$((WG_PORT + 1))" allowed-ips 0.0.0.0/0 persistent-keepalive 25
     ip link set dev wg0 up
 
-    # ساخت سرویس Gost روی سرور خارج برای دریافت ترافیک امن از پورت GOST_PORT
+    # ساخت سرویس Gost روی سرور خارج
     cat << EOF > /etc/systemd/system/gost-tunnel.service
 [Unit]
 Description=Gost Tunnel Server for Foreign
