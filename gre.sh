@@ -9,122 +9,95 @@ RESET=$(tput sgr0)
 echo -e "${CYAN}"
 echo "===================================="
 echo "          GitHub: Netplas"
-echo "   Stable Obfuscated Tunnel Script"
+echo "  AmneziaWG Anti-Filter Tunnel v3"
 echo "===================================="
 echo -e "${RESET}"
 
-if ! command -v wg &> /dev/null || ! command -v iptables &> /dev/null; then
-    echo "[*] Installing WireGuard and iptables..."
-    apt-get update && apt-get install -y wireguard iptables wget tar
-fi
-
-if [ ! -f /usr/local/bin/gost ]; then
-    echo "[*] Downloading and installing Gost..."
-    wget -q -O /tmp/gost.tar.gz https://github.com/go-gost/gost/releases/download/v3.2.6/gost_3.2.6_linux_amd64.tar.gz
-    tar -xzf /tmp/gost.tar.gz -C /tmp/
-    if [ -f /tmp/gost ]; then
-        mv /tmp/gost /usr/local/bin/
-    elif [ -f /tmp/gost_*_linux_amd64/gost ]; then
-        mv /tmp/gost_*_linux_amd64/gost /usr/local/bin/
-    fi
-    chmod +x /usr/local/bin/gost
-    rm -rf /tmp/gost.tar.gz /tmp/gost_*
+# بررسی نصب بودن amneziawg و iptables
+if ! command -v awg &> /dev/null; then
+    echo "[*] Installing AmneziaWG and iptables..."
+    apt-get update
+    apt-get install -y curl wget iptables software-properties-common
+    add-apt-repository -y ppa:amnezia/ppa &>/dev/null
+    apt-get update
+    apt-get install -y amneziawg amneziawg-tools
 fi
 
 echo "Select an option:"
 echo "1 - IRAN Server Configuration"
 echo "2 - FOREIGN Server Configuration"
-echo "3 - Uninstall & Remove Tunnel & Gost"
+echo "3 - Uninstall & Remove Tunnel"
 read -p "Enter your choice (1, 2 or 3): " LOCATION
 
 if [[ "$LOCATION" == "3" ]]; then
-    echo -e "${RED}[*] Uninstalling and cleaning up...${RESET}"
-    systemctl stop gost-tunnel 2>/dev/null
-    rm -f /etc/systemd/system/gost-tunnel.service
-    systemctl daemon-reload
-    ip link set wg0 down 2>/dev/null
-    ip link del wg0 2>/dev/null
-    rm -rf /etc/wireguard /usr/local/bin/gost
+    echo -e "${RED}[*] Uninstalling and cleaning up AmneziaWG tunnel...${RESET}"
+    ip link set awg0 down 2>/dev/null
+    ip link del awg0 2>/dev/null
+    rm -rf /etc/amnezia
     iptables -F
     iptables -X
     iptables -t nat -F
     iptables -t nat -X
+    iptables -t mangle -F
+    iptables -t mangle -X
     iptables -P INPUT ACCEPT
     iptables -P FORWARD ACCEPT
     iptables -P OUTPUT ACCEPT
     sysctl -w net.ipv4.ip_forward=0
-    echo -e "${GREEN}[+] Everything removed successfully!${RESET}"
+    echo -e "${GREEN}[+] Tunnel and all configurations removed successfully!${RESET}"
     exit 0
 fi
 
 read -p "Enter IRAN server IP: " IP_IRAN
 read -p "Enter FOREIGN server IP: " IP_FOREIGN
 
-read -p "Enter WireGuard Port (Default 51820): " WG_PORT
-WG_PORT=${WG_PORT:-51820}
-
-read -p "Enter Obfuscation Port for Gost (Default 443): " GOST_PORT
-GOST_PORT=${GOST_PORT:-443}
+# پرسیدن پورت امنزیا وایرگارد برای اطمینان از یکسان بودن در هر دو سرور
+read -p "Enter AmneziaWG Port (Default 51820): " AWG_PORT
+AWG_PORT=${AWG_PORT:-51820}
 
 MAIN_INTERFACE=$(ip route show default | awk '/default/ {print $5}' | head -n1)
 
-ip link del wg0 2>/dev/null
-systemctl stop gost-tunnel 2>/dev/null
+# حذف اینترفیس قبلی در صورت وجود
+ip link del awg0 2>/dev/null
 
 if [[ "$LOCATION" == "1" ]]; then
-    echo -e "${YELLOW}[*] Configuring IRAN server...${RESET}"
+    echo -e "${YELLOW}[*] Configuring IRAN server with AmneziaWG...${RESET}"
 
-    PrivKey=$(wg genkey)
-    PubKey=$(echo "$PrivKey" | wg pubkey)
+    PrivKey=$(awg genkey)
+    PubKey=$(echo "$PrivKey" | awg pubkey)
 
     echo -e "${YELLOW}[?] Please run the Foreign server script first and copy its Public Key.${RESET}"
     read -p "Enter FOREIGN server Public Key: " FOREIGN_PUBKEY
 
     sysctl -w net.ipv4.ip_forward=1 > /dev/null
 
-    ip link add dev wg0 type wireguard
-    ip address add 10.0.0.2/30 dev wg0 2>/dev/null
-    mkdir -p /etc/wireguard
-    echo "$PrivKey" > /etc/wireguard/private.key
+    # ساخت اینترفیس امنزیا وایرگارد با پارامترهای پنهان‌سازی
+    ip link add dev awg0 type amneziawg
+    ip address add 10.0.0.2/30 dev awg0
+    mkdir -p /etc/amnezia/amneziawg
+    echo "$PrivKey" > /etc/amnezia/amneziawg/private.key
     
-    # اتصال وایرگارد ایران به پورت محلی Gost
-    wg set wg0 listen-port $((WG_PORT + 10)) private-key /etc/wireguard/private.key
-    wg set wg0 peer "$FOREIGN_PUBKEY" endpoint "127.0.0.1:$((WG_PORT + 10))" allowed-ips 0.0.0.0/0 persistent-keepalive 25
-    ip link set dev wg0 up
+    awg set awg0 listen-port $AWG_PORT private-key /etc/amnezia/amneziawg/private.key \
+        jc 4 jmin 50 jmax 1000 s1 55 s2 75 h1 12345678 h2 87654321 h3 13579246 h4 24681357
+    
+    awg set awg0 peer "$FOREIGN_PUBKEY" endpoint "$IP_FOREIGN:$AWG_PORT" allowed-ips 0.0.0.0/0 persistent-keepalive 25
+    ip link set dev awg0 up
 
-    # سرویس Gost روی ایران برای ارسال به سرور خارج
-    cat << EOF > /etc/systemd/system/gost-tunnel.service
-[Unit]
-Description=Gost Tunnel Client for Iran
-After=network.target
-
-[Service]
-ExecStart=/usr/local/bin/gost -L udp://127.0.0.1:$((WG_PORT + 10))/127.0.0.1:$((WG_PORT + 10))?net=tcp -F tcp://$IP_FOREIGN:$GOST_PORT
-Restart=always
-RestartSec=3
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    systemctl daemon-reload
-    systemctl enable gost-tunnel
-    systemctl restart gost-tunnel
-
+    # پاکسازی قوانین قبلی و اعمال فوروارد (حفظ استثنای پورت‌های 22، 80 و 10052 روی سرور ایران)
     iptables -t nat -F
-    iptables -t nat -A PREROUTING -i $MAIN_INTERFACE -p tcp ! --dport 22 -j DNAT --to-destination 10.0.0.1
+    iptables -t nat -A PREROUTING -i $MAIN_INTERFACE -p tcp -m multiport ! --dports 22,80,10052 -j DNAT --to-destination 10.0.0.1
     iptables -t nat -A PREROUTING -i $MAIN_INTERFACE -p udp -j DNAT --to-destination 10.0.0.1
-    iptables -t nat -A POSTROUTING -o wg0 -j MASQUERADE
+    iptables -t nat -A POSTROUTING -o awg0 -j MASQUERADE
     iptables -t nat -A POSTROUTING -o $MAIN_INTERFACE -j MASQUERADE
 
-    echo -e "${GREEN}[+] Iran server configured successfully!${RESET}"
-    echo "Your Iran Server Public Key: $PubKey"
+    echo -e "${GREEN}[+] Iran server configured successfully with anti-filter tunnel!${RESET}"
+    echo "Your Iran Server Public Key (give this to foreign if needed): $PubKey"
 
 elif [[ "$LOCATION" == "2" ]]; then
-    echo -e "${YELLOW}[*] Configuring FOREIGN server...${RESET}"
+    echo -e "${YELLOW}[*] Configuring FOREIGN server with AmneziaWG...${RESET}"
 
-    PrivKey=$(wg genkey)
-    PubKey=$(echo "$PrivKey" | wg pubkey)
+    PrivKey=$(awg genkey)
+    PubKey=$(echo "$PrivKey" | awg pubkey)
 
     echo -e "Your Foreign Server Public Key is: ${CYAN}$PubKey${RESET}"
     read -p "Press Enter after you have saved this key..."
@@ -133,40 +106,23 @@ elif [[ "$LOCATION" == "2" ]]; then
 
     sysctl -w net.ipv4.ip_forward=1 > /dev/null
 
-    ip link add dev wg0 type wireguard
-    ip address add 10.0.0.1/30 dev wg0 2>/dev/null
-    mkdir -p /etc/wireguard
-    echo "$PrivKey" > /etc/wireguard/private.key
+    # ساخت اینترفیس امنزیا وایرگارد با پارامترهای پنهان‌سازی یکسان
+    ip link add dev awg0 type amneziawg
+    ip address add 10.0.0.1/30 dev awg0
+    mkdir -p /etc/amnezia/amneziawg
+    echo "$PrivKey" > /etc/amnezia/amneziawg/private.key
     
-    wg set wg0 listen-port $((WG_PORT + 10)) private-key /etc/wireguard/private.key
-    wg set wg0 peer "$IRAN_PUBKEY" endpoint "127.0.0.1:$((WG_PORT + 10))" allowed-ips 0.0.0.0/0 persistent-keepalive 25
-    ip link set dev wg0 up
+    awg set awg0 listen-port $AWG_PORT private-key /etc/amnezia/amneziawg/private.key \
+        jc 4 jmin 50 jmax 1000 s1 55 s2 75 h1 12345678 h2 87654321 h3 13579246 h4 24681357
+    
+    awg set awg0 peer "$IRAN_PUBKEY" endpoint "$IP_IRAN:$AWG_PORT" allowed-ips 0.0.0.0/0 persistent-keepalive 25
+    ip link set dev awg0 up
 
-    # سرویس Gost روی سرور خارج برای دریافت از ایران
-    cat << EOF > /etc/systemd/system/gost-tunnel.service
-[Unit]
-Description=Gost Tunnel Server for Foreign
-After=network.target
-
-[Service]
-ExecStart=/usr/local/bin/gost -L tcp://:$GOST_PORT/127.0.0.1:$((WG_PORT + 10))
-Restart=always
-RestartSec=3
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    systemctl daemon-reload
-    systemctl enable gost-tunnel
-    systemctl restart gost-tunnel
-
-    iptables -A INPUT -p tcp --dport $GOST_PORT -j ACCEPT
-    iptables -A FORWARD -i wg0 -j ACCEPT
-    iptables -A FORWARD -o wg0 -j ACCEPT
+    iptables -A FORWARD -i awg0 -j ACCEPT
+    iptables -A FORWARD -o awg0 -j ACCEPT
     iptables -t nat -A POSTROUTING -o $MAIN_INTERFACE -j MASQUERADE
 
-    echo -e "${GREEN}[+] Foreign server configured successfully!${RESET}"
+    echo -e "${GREEN}[+] Foreign server configured successfully with anti-filter tunnel!${RESET}"
 
 else
     echo -e "${RED}[!] Invalid selection. Please enter 1, 2 or 3.${RESET}"
