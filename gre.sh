@@ -1,412 +1,683 @@
-#!/usr/bin/env bash
-# ============================================================
-#  GitHub: Netplas
-#  AmneziaWG Anti-Filter Tunnel v4.3 (Iran <-> Foreign)
-#  - Advanced Anti-DPI Obfuscation & Expanded Padding Ranges
-#  - Fully randomized profile & unique tokens on every run
-#  - Optimized for TCP traffic flow & fingerprint evasion
-# ============================================================
+#!/bin/bash
 
-set -uo pipefail
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+BOLD='\033[1m'
 
-IFACE="awg0"
-CFG_DIR="/etc/amnezia/amneziawg"
-CFG="${CFG_DIR}/${IFACE}.conf"
-META="${CFG_DIR}/${IFACE}.meta"
-IR_ADDR="10.0.0.2"
-FR_ADDR="10.0.0.1"
-CIDR="30"
-KEEP_TCP_PORTS="22,80,443,10052"   # ports that must stay on the Iran server
+APP_NAME="port-tunnel"
+INSTALL_DIR="/usr/local/lib/$APP_NAME"
+BIN_PATH="$INSTALL_DIR/core"
+CONFIG_DIR="/etc/$APP_NAME"
+SERVICE_DIR="/etc/systemd/system"
 
-# ---------- colors (safe when TERM is unset) ----------
-if [[ -t 1 ]] && command -v tput >/dev/null 2>&1 && tput setaf 1 >/dev/null 2>&1; then
-  CYAN=$(tput setaf 6); YELLOW=$(tput setaf 3); GREEN=$(tput setaf 2)
-  RED=$(tput setaf 1); BOLD=$(tput bold); RESET=$(tput sgr0)
-else
-  CYAN=""; YELLOW=""; GREEN=""; RED=""; BOLD=""; RESET=""
+clear
+echo -e "${CYAN}${BOLD}"
+echo "=============================================="
+echo "          PORT TUNNEL INSTALLER"
+echo "=============================================="
+echo -e "${NC}"
+
+if [ "$EUID" -ne 0 ]; then
+    echo -e "${RED}Please run this script as root (sudo).${NC}"
+    exit 1
 fi
-info()  { echo "${CYAN}[*]${RESET} $*"; }
-ok()    { echo "${GREEN}[+]${RESET} $*"; }
-warn()  { echo "${YELLOW}[!]${RESET} $*"; }
-err()   { echo "${RED}[x]${RESET} $*" >&2; }
-die()   { err "$*"; exit 1; }
 
-banner() {
-  echo "${CYAN}${BOLD}"
-  echo "===================================="
-  echo "          GitHub: Netplas"
-  echo "  AmneziaWG Anti-Filter Tunnel v4.3"
-  echo "===================================="
-  echo "${RESET}"
+mkdir -p "$INSTALL_DIR" "$CONFIG_DIR"
+
+# ------------------ Go Core ------------------
+write_core() {
+cat > "$INSTALL_DIR/main.go" << 'EOF'
+package main
+
+import (
+	"bufio"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/json"
+	"io"
+	"log"
+	"net"
+	"os"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+type Config struct {
+	Mode       string            `json:"mode"`
+	BindAddr   string            `json:"bind_addr,omitempty"`
+	ServerAddr string            `json:"server_addr,omitempty"`
+	Token      string            `json:"token"`
+	Services   map[string]string `json:"services"`
 }
 
-[[ $EUID -eq 0 ]] || die "Run this script as root."
+const (
+	tAuth  = 1
+	tOpen  = 3
+	tData  = 5
+	tClose = 6
+	tPing  = 7
+	tPong  = 8
+)
 
-# ---------- helpers ----------
-rnd() { # rnd MIN MAX  -> uniform-ish random integer
-  local min=$1 max=$2 span=$(( $2 - $1 + 1 ))
-  echo $(( min + ( $(od -An -N4 -tu4 /dev/urandom | tr -d ' ') % span ) ))
+type Frame struct {
+	Type   byte
+	Stream uint32
+	Data   []byte
 }
 
-main_iface() {
-  ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}'
+func writeFrame(w io.Writer, f Frame) error {
+	header := make([]byte, 9)
+	header[0] = f.Type
+	binary.BigEndian.PutUint32(header[1:5], f.Stream)
+	binary.BigEndian.PutUint32(header[5:9], uint32(len(f.Data)))
+	_, err := w.Write(append(header, f.Data...))
+	return err
 }
 
-pub_ip() { curl -4 -fsS --max-time 6 https://api.ipify.org 2>/dev/null || true; }
-
-# ---------- install ----------
-detect_os() {
-  . /etc/os-release 2>/dev/null || true
-  OS_ID="${ID:-unknown}"; OS_LIKE="${ID_LIKE:-}"; OS_CODENAME="${VERSION_CODENAME:-}"
+func readFrame(r io.Reader) (Frame, error) {
+	header := make([]byte, 9)
+	if _, err := io.ReadFull(r, header); err != nil {
+		return Frame{}, err
+	}
+	length := binary.BigEndian.Uint32(header[5:9])
+	data := make([]byte, length)
+	if length > 0 {
+		if _, err := io.ReadFull(r, data); err != nil {
+			return Frame{}, err
+		}
+	}
+	return Frame{Type: header[0], Stream: binary.BigEndian.Uint32(header[1:5]), Data: data}, nil
 }
 
-install_tools() {
-  detect_os
-  info "Installing prerequisites..."
-  export DEBIAN_FRONTEND=noninteractive
-  apt-get update -qq
-  apt-get install -y -qq curl wget git iptables iproute2 openresolv \
-      software-properties-common ca-certificates build-essential \
-      "linux-headers-$(uname -r)" >/dev/null 2>&1 || \
-  apt-get install -y -qq curl wget git iptables iproute2 \
-      software-properties-common ca-certificates build-essential >/dev/null 2>&1
-
-  if [[ "$OS_ID" == "ubuntu" ]]; then
-    add-apt-repository -y ppa:amnezia/ppa >/dev/null 2>&1 || true
-    apt-get update -qq
-    apt-get install -y -qq amneziawg amneziawg-tools >/dev/null 2>&1 || true
-  fi
-
-  if ! command -v awg >/dev/null 2>&1; then
-    warn "Package not available; building amneziawg-tools from source..."
-    rm -rf /tmp/awg-tools
-    git clone -q --depth 1 https://github.com/amnezia-vpn/amneziawg-tools /tmp/awg-tools \
-      || die "Cannot fetch amneziawg-tools."
-    make -s -C /tmp/awg-tools/src -j"$(nproc)" >/dev/null \
-      && make -s -C /tmp/awg-tools/src install >/dev/null \
-      || die "Build of amneziawg-tools failed."
-  fi
-  command -v awg >/dev/null 2>&1 || die "'awg' still not found."
-  ok "amneziawg-tools ready ($(command -v awg))."
+func deriveKey(token string) []byte {
+	sum := sha256.Sum256([]byte(token))
+	return sum[:]
 }
 
-kernel_ok() {
-  modprobe amneziawg >/dev/null 2>&1
-  ip link add dev awgtest type amneziawg >/dev/null 2>&1 || return 1
-  ip link del awgtest >/dev/null 2>&1
-  return 0
+func deriveIV(seed []byte, suffix string) []byte {
+	h := sha256.New()
+	h.Write(seed)
+	h.Write([]byte(suffix))
+	return h.Sum(nil)[:16]
 }
 
-install_userspace() {
-  command -v amneziawg-go >/dev/null 2>&1 && { ok "amneziawg-go already installed."; return 0; }
-  warn "Kernel module unavailable (LXC/OpenVZ detected). Installing amneziawg-go..."
-  export DEBIAN_FRONTEND=noninteractive
-  apt-get install -y -qq golang-go >/dev/null 2>&1 || apt-get install -y -qq golang >/dev/null 2>&1
-  command -v go >/dev/null 2>&1 || die "Go toolchain not available."
-  rm -rf /tmp/awg-go
-  git clone -q --depth 1 https://github.com/amnezia-vpn/amneziawg-go /tmp/awg-go \
-    || die "Cannot fetch amneziawg-go."
-  ( cd /tmp/awg-go && go build -o /usr/local/bin/amneziawg-go . ) >/dev/null 2>&1 \
-    || die "Build of amneziawg-go failed."
-  chmod +x /usr/local/bin/amneziawg-go
-  [[ -e /dev/net/tun ]] || { mkdir -p /dev/net; mknod /dev/net/tun c 10 200 2>/dev/null; chmod 600 /dev/net/tun; }
-  ok "amneziawg-go installed."
+func wrapConn(conn net.Conn, key, ivIn, ivOut []byte) (io.Reader, io.Writer) {
+	blockR, _ := aes.NewCipher(key)
+	blockW, _ := aes.NewCipher(key)
+	r := cipher.StreamReader{S: cipher.NewCTR(blockR, ivIn), R: conn}
+	w := &cipher.StreamWriter{S: cipher.NewCTR(blockW, ivOut), W: conn}
+	return r, w
 }
 
-setup_backend() {
-  if kernel_ok; then
-    ok "Kernel module 'amneziawg' works."
-    echo "amneziawg" > /etc/modules-load.d/amneziawg.conf
-    USERSPACE=0
-  else
-    install_userspace
-    USERSPACE=1
-  fi
-  mkdir -p /etc/default
-  if [[ $USERSPACE -eq 1 ]]; then
-    cat > /etc/default/amneziawg <<'EOF'
-WG_QUICK_USERSPACE_IMPLEMENTATION=amneziawg-go
-AWG_QUICK_USERSPACE_IMPLEMENTATION=amneziawg-go
-WG_SUDO=1
+func setNoDelay(conn net.Conn) {
+	if tc, ok := conn.(*net.TCPConn); ok {
+		_ = tc.SetNoDelay(true)
+	}
+}
+
+func runServer(cfg Config) {
+	ln, err := net.Listen("tcp", cfg.BindAddr)
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Println("[Server] Listening on", cfg.BindAddr)
+
+	var nextID uint32 = 1
+
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			continue
+		}
+		go handleServerConn(conn, cfg, &nextID)
+	}
+}
+
+func handleServerConn(conn net.Conn, cfg Config, nextID *uint32) {
+	defer conn.Close()
+	setNoDelay(conn)
+
+	marker := make([]byte, 1)
+	if _, err := io.ReadFull(conn, marker); err != nil || marker[0] != 1 {
+		return
+	}
+
+	seed := make([]byte, 32)
+	if _, err := io.ReadFull(conn, seed); err != nil {
+		return
+	}
+
+	key := deriveKey(cfg.Token)
+	ivIn := deriveIV(seed, "c2s")
+	ivOut := deriveIV(seed, "s2c")
+	r, w := wrapConn(conn, key, ivIn, ivOut)
+	br := bufio.NewReaderSize(r, 128*1024)
+
+	auth, err := readFrame(br)
+	if err != nil || auth.Type != tAuth || string(auth.Data) != cfg.Token {
+		log.Println("[Server] Auth failed")
+		return
+	}
+	log.Println("[Server] Client authenticated")
+
+	streams := make(map[uint32]net.Conn)
+	var streamsMu sync.Mutex
+	var writeMu sync.Mutex
+
+	send := func(f Frame) error {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		return writeFrame(w, f)
+	}
+
+	for name, addr := range cfg.Services {
+		ln, err := net.Listen("tcp", addr)
+		if err != nil {
+			log.Println("[Server] Listen error on", addr, ":", err)
+			continue
+		}
+		log.Println("[Server] Service:", name, "->", addr)
+
+		go func(serviceName string, listener net.Listener) {
+			for {
+				c, err := listener.Accept()
+				if err != nil {
+					return
+				}
+				setNoDelay(c)
+				id := atomic.AddUint32(nextID, 1)
+
+				streamsMu.Lock()
+				streams[id] = c
+				streamsMu.Unlock()
+
+				if err := send(Frame{Type: tOpen, Stream: id, Data: []byte(serviceName)}); err != nil {
+					c.Close()
+					streamsMu.Lock()
+					delete(streams, id)
+					streamsMu.Unlock()
+					continue
+				}
+
+				go func(streamID uint32, local net.Conn) {
+					buf := make([]byte, 32*1024)
+					for {
+						n, err := local.Read(buf)
+						if n > 0 {
+							data := make([]byte, n)
+							copy(data, buf[:n])
+							if send(Frame{Type: tData, Stream: streamID, Data: data}) != nil {
+								break
+							}
+						}
+						if err != nil {
+							break
+						}
+					}
+					_ = send(Frame{Type: tClose, Stream: streamID})
+					streamsMu.Lock()
+					delete(streams, streamID)
+					streamsMu.Unlock()
+					local.Close()
+				}(id, c)
+			}
+		}(name, ln)
+	}
+
+	for {
+		f, err := readFrame(br)
+		if err != nil {
+			break
+		}
+		switch f.Type {
+		case tData:
+			streamsMu.Lock()
+			c := streams[f.Stream]
+			streamsMu.Unlock()
+			if c != nil {
+				_, _ = c.Write(f.Data)
+			}
+		case tClose:
+			streamsMu.Lock()
+			if c, ok := streams[f.Stream]; ok {
+				c.Close()
+				delete(streams, f.Stream)
+			}
+			streamsMu.Unlock()
+		case tPing:
+			_ = send(Frame{Type: tPong})
+		}
+	}
+
+	streamsMu.Lock()
+	for id, c := range streams {
+		c.Close()
+		delete(streams, id)
+	}
+	streamsMu.Unlock()
+	log.Println("[Server] Client disconnected")
+}
+
+func runClient(cfg Config) {
+	for {
+		if err := clientOnce(cfg); err != nil {
+			log.Println("[Client] Error:", err)
+		}
+		time.Sleep(3 * time.Second)
+	}
+}
+
+func clientOnce(cfg Config) error {
+	conn, err := net.DialTimeout("tcp", cfg.ServerAddr, 12*time.Second)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	setNoDelay(conn)
+
+	seed := make([]byte, 32)
+	rand.Read(seed)
+
+	if _, err := conn.Write([]byte{1}); err != nil {
+		return err
+	}
+	if _, err := conn.Write(seed); err != nil {
+		return err
+	}
+
+	key := deriveKey(cfg.Token)
+	ivOut := deriveIV(seed, "c2s")
+	ivIn := deriveIV(seed, "s2c")
+	r, w := wrapConn(conn, key, ivIn, ivOut)
+	br := bufio.NewReaderSize(r, 128*1024)
+
+	var writeMu sync.Mutex
+	send := func(f Frame) error {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		return writeFrame(w, f)
+	}
+
+	if err := send(Frame{Type: tAuth, Data: []byte(cfg.Token)}); err != nil {
+		return err
+	}
+	log.Println("[Client] Connected to", cfg.ServerAddr)
+
+	streams := make(map[uint32]net.Conn)
+	var streamsMu sync.Mutex
+
+	go func() {
+		t := time.NewTicker(8 * time.Second)
+		defer t.Stop()
+		for range t.C {
+			if send(Frame{Type: tPing}) != nil {
+				return
+			}
+		}
+	}()
+
+	for {
+		f, err := readFrame(br)
+		if err != nil {
+			break
+		}
+		switch f.Type {
+		case tOpen:
+			name := string(f.Data)
+			addr, ok := cfg.Services[name]
+			if !ok {
+				_ = send(Frame{Type: tClose, Stream: f.Stream})
+				continue
+			}
+			local, err := net.DialTimeout("tcp", addr, 6*time.Second)
+			if err != nil {
+				_ = send(Frame{Type: tClose, Stream: f.Stream})
+				continue
+			}
+			setNoDelay(local)
+
+			streamsMu.Lock()
+			streams[f.Stream] = local
+			streamsMu.Unlock()
+
+			go func(streamID uint32, local net.Conn) {
+				buf := make([]byte, 32*1024)
+				for {
+					n, err := local.Read(buf)
+					if n > 0 {
+						data := make([]byte, n)
+						copy(data, buf[:n])
+						if send(Frame{Type: tData, Stream: streamID, Data: data}) != nil {
+							break
+						}
+					}
+					if err != nil {
+						break
+					}
+				}
+				_ = send(Frame{Type: tClose, Stream: streamID})
+				streamsMu.Lock()
+				delete(streams, streamID)
+				streamsMu.Unlock()
+				local.Close()
+			}(f.Stream, local)
+
+		case tData:
+			streamsMu.Lock()
+			c := streams[f.Stream]
+			streamsMu.Unlock()
+			if c != nil {
+				_, _ = c.Write(f.Data)
+			}
+		case tClose:
+			streamsMu.Lock()
+			if c, ok := streams[f.Stream]; ok {
+				c.Close()
+				delete(streams, f.Stream)
+			}
+			streamsMu.Unlock()
+		}
+	}
+
+	streamsMu.Lock()
+	for id, c := range streams {
+		c.Close()
+		delete(streams, id)
+	}
+	streamsMu.Unlock()
+	return io.EOF
+}
+
+func main() {
+	if len(os.Args) < 2 {
+		log.Fatal("Usage: core <config.json>")
+	}
+	data, err := os.ReadFile(os.Args[1])
+	if err != nil {
+		log.Fatal(err)
+	}
+	var cfg Config
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		log.Fatal(err)
+	}
+	switch cfg.Mode {
+	case "server":
+		runServer(cfg)
+	case "client":
+		runClient(cfg)
+	default:
+		log.Fatal("invalid mode")
+	}
+}
 EOF
-  else
-    : > /etc/default/amneziawg
-  fi
 }
 
-# ---------- advanced obfuscation profile (v4.3 anti-DPI) ----------
-gen_profile() {
-  # Wider and more unpredictable random ranges for anti-fingerprinting
-  JC=$(rnd 4 12)
-  JMIN=$(rnd 30 120)
-  JMAX=$(rnd $((JMIN + 120)) 1400)
-  
-  S1=$(rnd 15 250)
-  S2=$(rnd 15 250)
-  while [[ $((S1 + 56)) -eq $S2 ]]; do S2=$(rnd 15 250); done
-  
-  S3=$(rnd 10 120)
-  S4=$(rnd 10 80)
+# ------------------ Install Core ------------------
+install_core() {
+    echo -e "${BLUE}Preparing tunnel core...${NC}"
 
-  # Expanded 32-bit space for magic headers to break static signatures
-  H1=$(rnd 1000000 4000000000)
-  H2=$(rnd 1000000 4000000000)
-  H3=$(rnd 1000000 4000000000)
-  H4=$(rnd 1000000 4000000000)
-  while [[ "$H2" == "$H1" ]]; do H2=$(rnd 1000000 4000000000); done
-  while [[ "$H3" == "$H1" || "$H3" == "$H2" ]]; do H3=$(rnd 1000000 4000000000); done
-  while [[ "$H4" == "$H1" || "$H4" == "$H2" || "$H4" == "$H3" ]]; do H4=$(rnd 1000000 4000000000); done
-}
-
-encode_token() {
-  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
-    "v4.3" "$FOREIGN_IP" "$AWG_PORT" "$FR_PUB" "$PSK" \
-    "$JC" "$JMIN" "$JMAX" "$S1" "$S2" "$S3" "$S4" "$H1" "$H2" "$H3" "$H4" \
-    | base64 -w0
-}
-
-decode_token() {
-  local raw; raw=$(echo "$1" | tr -d ' \n\r' | base64 -d 2>/dev/null) || die "Invalid token."
-  IFS='|' read -r V FOREIGN_IP AWG_PORT FR_PUB PSK JC JMIN JMAX S1 S2 S3 S4 H1 H2 H3 H4 <<< "$raw"
-  [[ "$V" == "v4.3" || "$V" == "v4.2" || "$V" == "v4" ]] || die "Token version mismatch."
-  [[ -n "$FR_PUB" && -n "$AWG_PORT" ]] || die "Token is incomplete."
-  # Fallbacks if older version token is passed
-  S3=${S3:-15}
-  S4=${S4:-10}
-}
-
-# ---------- config writers ----------
-common_iface_block() {
-  cat <<EOF
-[Interface]
-PrivateKey = ${PRIV}
-Address = ${SELF_ADDR}/${CIDR}
-ListenPort = ${AWG_PORT}
-MTU = ${MTU}
-Jc = ${JC}
-Jmin = ${JMIN}
-Jmax = ${JMAX}
-S1 = ${S1}
-S2 = ${S2}
-S3 = ${S3}
-S4 = ${S4}
-H1 = ${H1}
-H2 = ${H2}
-H3 = ${H3}
-H4 = ${H4}
-EOF
-}
-
-write_iran_cfg() {
-  local NIC=$1
-  mkdir -p "$CFG_DIR"; chmod 700 "$CFG_DIR"
-  { common_iface_block
-    cat <<EOF
-PostUp = sysctl -qw net.ipv4.ip_forward=1
-PostUp = iptables -t nat -N AWG_DNAT 2>/dev/null || true
-PostUp = iptables -t nat -F AWG_DNAT
-PostUp = iptables -t nat -C PREROUTING -i ${NIC} -j AWG_DNAT 2>/dev/null || iptables -t nat -I PREROUTING 1 -i ${NIC} -j AWG_DNAT
-PostUp = iptables -t nat -A AWG_DNAT -p tcp -m multiport ! --dports ${KEEP_TCP_PORTS} -j DNAT --to-destination ${FR_ADDR}
-PostUp = iptables -t nat -A AWG_DNAT -p udp -m multiport ! --dports ${AWG_PORT} -j DNAT --to-destination ${FR_ADDR}
-PostUp = iptables -t nat -C POSTROUTING -o %i -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o %i -j MASQUERADE
-PostUp = iptables -C FORWARD -i ${NIC} -o %i -j ACCEPT 2>/dev/null || iptables -I FORWARD 1 -i ${NIC} -o %i -j ACCEPT
-PostUp = iptables -C FORWARD -i %i -o ${NIC} -j ACCEPT 2>/dev/null || iptables -I FORWARD 1 -i %i -o ${NIC} -j ACCEPT
-PostUp = iptables -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
-PostDown = iptables -t nat -D PREROUTING -i ${NIC} -j AWG_DNAT 2>/dev/null || true
-PostDown = iptables -t nat -F AWG_DNAT 2>/dev/null || true
-PostDown = iptables -t nat -X AWG_DNAT 2>/dev/null || true
-PostDown = iptables -t nat -D POSTROUTING -o %i -j MASQUERADE 2>/dev/null || true
-PostDown = iptables -D FORWARD -i ${NIC} -o %i -j ACCEPT 2>/dev/null || true
-PostDown = iptables -D FORWARD -i %i -o ${NIC} -j ACCEPT 2>/dev/null || true
-PostDown = iptables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
-
-[Peer]
-PublicKey = ${FR_PUB}
-PresharedKey = ${PSK}
-AllowedIPs = ${FR_ADDR}/32
-Endpoint = ${FOREIGN_IP}:${AWG_PORT}
-PersistentKeepalive = 25
-EOF
-  } > "$CFG"
-  chmod 600 "$CFG"
-}
-
-write_foreign_cfg() {
-  local NIC=$1
-  mkdir -p "$CFG_DIR"; chmod 700 "$CFG_DIR"
-  { common_iface_block
-    cat <<EOF
-PostUp = sysctl -qw net.ipv4.ip_forward=1
-PostUp = iptables -C FORWARD -i %i -j ACCEPT 2>/dev/null || iptables -I FORWARD 1 -i %i -j ACCEPT
-PostUp = iptables -C FORWARD -o %i -j ACCEPT 2>/dev/null || iptables -I FORWARD 1 -o %i -j ACCEPT
-PostUp = iptables -t nat -C POSTROUTING -s ${IR_ADDR}/32 -o ${NIC} -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s ${IR_ADDR}/32 -o ${NIC} -j MASQUERADE
-PostUp = iptables -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
-PostDown = iptables -D FORWARD -i %i -j ACCEPT 2>/dev/null || true
-PostDown = iptables -D FORWARD -o %i -j ACCEPT 2>/dev/null || true
-PostDown = iptables -t nat -D POSTROUTING -s ${IR_ADDR}/32 -o ${NIC} -j MASQUERADE 2>/dev/null || true
-PostDown = iptables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
-EOF
-    if [[ -n "${IR_PUB:-}" ]]; then
-      cat <<EOF
-
-[Peer]
-PublicKey = ${IR_PUB}
-PresharedKey = ${PSK}
-AllowedIPs = ${IR_ADDR}/32
-PersistentKeepalive = 25
-EOF
+    if ! command -v go >/dev/null 2>&1; then
+        echo -e "${YELLOW}Go not found, installing...${NC}"
+        apt update -y >/dev/null 2>&1
+        apt install -y golang-go >/dev/null 2>&1 || {
+            echo -e "${RED}Failed to install Go.${NC}"
+            exit 1
+        }
     fi
-  } > "$CFG"
-  chmod 600 "$CFG"
+
+    write_core
+    cd "$INSTALL_DIR" || exit 1
+
+    echo -e "${BLUE}Compiling core...${NC}"
+    if GO111MODULE=off go build -ldflags="-s -w" -o "$BIN_PATH" main.go; then
+        chmod +x "$BIN_PATH"
+        echo -e "${GREEN}Core installed successfully.${NC}"
+    else
+        echo -e "${RED}Build failed.${NC}"
+        exit 1
+    fi
 }
 
-bring_up() {
-  set -a; . /etc/default/amneziawg 2>/dev/null || true; set +a
-  awg-quick down "$IFACE" >/dev/null 2>&1 || true
-  ip link del "$IFACE" >/dev/null 2>&1 || true
-  awg-quick up "$IFACE" || die "awg-quick failed to start ${IFACE}."
-  if [[ -f /usr/lib/systemd/system/awg-quick@.service || -f /lib/systemd/system/awg-quick@.service ]]; then
-    mkdir -p "/etc/systemd/system/awg-quick@${IFACE}.service.d"
-    cat > "/etc/systemd/system/awg-quick@${IFACE}.service.d/override.conf" <<'EOF'
+# ------------------ Create Service ------------------
+create_service() {
+    local name=$1
+    local role=$2
+
+    cat > "$SERVICE_DIR/${APP_NAME}-${name}.service" <<EOF
+[Unit]
+Description=Port Tunnel ($role) - $name
+After=network.target
+
 [Service]
-EnvironmentFile=-/etc/default/amneziawg
-Restart=on-failure
-RestartSec=5
+Type=simple
+ExecStart=$BIN_PATH $CONFIG_DIR/${name}.json
+Restart=always
+RestartSec=3
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
 EOF
+
     systemctl daemon-reload
-    systemctl enable "awg-quick@${IFACE}" >/dev/null 2>&1 && ok "Enabled on boot."
-  fi
-  ok "Interface ${IFACE} is up."
+    systemctl enable "${APP_NAME}-${name}" >/dev/null 2>&1
+    systemctl restart "${APP_NAME}-${name}"
 }
 
-sysctl_tuning() {
-  cat > /etc/sysctl.d/99-awg.conf <<'EOF'
-net.ipv4.ip_forward=1
-net.ipv4.conf.all.rp_filter=2
-net.core.default_qdisc=fq
-net.ipv4.tcp_congestion_control=bbr
-net.ipv4.tcp_mtu_probing=1
-EOF
-  sysctl -q --system >/dev/null 2>&1 || true
+# ------------------ List Tunnels ------------------
+list_tunnels() {
+    ls "$CONFIG_DIR" 2>/dev/null | grep '\.json$' | sed 's/\.json$//'
 }
 
-wait_handshake() {
-  info "Waiting for handshake (up to 25s)..."
-  for _ in $(seq 1 25); do
-    if awg show "$IFACE" latest-handshakes 2>/dev/null | awk '{if ($2+0 > 0) found=1} END{exit !found}'; then
-      ok "Handshake established."
-      return 0
+# ------------------ Delete Tunnel ------------------
+delete_tunnel() {
+    echo -e "\n${YELLOW}${BOLD}=== Delete Tunnel ===${NC}\n"
+
+    TUNNELS=($(list_tunnels))
+    if [ ${#TUNNELS[@]} -eq 0 ]; then
+        echo -e "${RED}No tunnels found.${NC}"
+        return
     fi
-    sleep 1
-  done
-  warn "No handshake yet. Check provider firewall for UDP port ${AWG_PORT}."
-  return 1
+
+    echo -e "${CYAN}Available tunnels:${NC}"
+    for i in "${!TUNNELS[@]}"; do
+        STATUS=$(systemctl is-active "${APP_NAME}-${TUNNELS[$i]}" 2>/dev/null || echo "inactive")
+        if [ "$STATUS" == "active" ]; then
+            echo -e "  $((i+1)). ${TUNNELS[$i]} - ${GREEN}Running${NC}"
+        else
+            echo -e "  $((i+1)). ${TUNNELS[$i]} - ${RED}Stopped${NC}"
+        fi
+    done
+
+    echo ""
+    read -p "Enter tunnel number to delete (0 to cancel): " SEL
+    if [ "$SEL" == "0" ] || [ -z "$SEL" ]; then
+        return
+    fi
+
+    IDX=$((SEL-1))
+    if [ -z "${TUNNELS[$IDX]}" ]; then
+        echo -e "${RED}Invalid selection.${NC}"
+        return
+    fi
+
+    TNAME="${TUNNELS[$IDX]}"
+
+    echo -e "${RED}Are you sure you want to delete tunnel '${TNAME}'? (y/n)${NC}"
+    read -p "> " CONFIRM
+    if [ "$CONFIRM" != "y" ] && [ "$CONFIRM" != "Y" ]; then
+        echo -e "${YELLOW}Cancelled.${NC}"
+        return
+    fi
+
+    systemctl stop "${APP_NAME}-${TNAME}" >/dev/null 2>&1
+    systemctl disable "${APP_NAME}-${TNAME}" >/dev/null 2>&1
+    rm -f "$SERVICE_DIR/${APP_NAME}-${TNAME}.service"
+    rm -f "$CONFIG_DIR/${TNAME}.json"
+    systemctl daemon-reload
+
+    echo -e "${GREEN}Tunnel '${TNAME}' deleted successfully.${NC}"
 }
 
-# ============================ MENU ============================
-banner
-cat <<EOF
-Select an option:
-  1 - IRAN server      (run this AFTER the foreign server)
-  2 - FOREIGN server   (run this FIRST)
-  3 - FOREIGN: add / update the Iran peer key
-  4 - Diagnostics
-  5 - Uninstall & clean up
+# ------------------ Iran Server ------------------
+setup_iran() {
+    echo -e "\n${YELLOW}${BOLD}=== Setup Iran Server ===${NC}\n"
+
+    read -p "Tunnel name [main]: " TNAME
+    TNAME=${TNAME:-main}
+
+    read -p "Control port [2333]: " CPORT
+    CPORT=${CPORT:-2333}
+
+    read -p "Public ports (comma separated, e.g. 443,80,2053,2083,2087): " PORTS
+    if [ -z "$PORTS" ]; then
+        echo -e "${RED}At least one port is required.${NC}"
+        return
+    fi
+
+    read -p "Token (leave empty for random): " TOKEN
+    if [ -z "$TOKEN" ]; then
+        TOKEN=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 32)
+    fi
+
+    SERVICES="{"
+    FIRST=1
+    IFS=',' read -ra PARR <<< "$PORTS"
+    for P in "${PARR[@]}"; do
+        P=$(echo "$P" | xargs)
+        [ -z "$P" ] && continue
+        if [ $FIRST -eq 0 ]; then
+            SERVICES+=","
+        fi
+        SERVICES+="\"$P\":\"0.0.0.0:$P\""
+        FIRST=0
+    done
+    SERVICES+="}"
+
+    cat > "$CONFIG_DIR/${TNAME}.json" <<EOF
+{
+  "mode": "server",
+  "bind_addr": "0.0.0.0:$CPORT",
+  "token": "$TOKEN",
+  "services": $SERVICES
+}
 EOF
-read -rp "Enter your choice: " CHOICE
 
-case "$CHOICE" in
-2)
-  install_tools; setup_backend; sysctl_tuning
-  NIC=$(main_iface); [[ -n "$NIC" ]] || die "Cannot detect default network interface."
-  FOREIGN_IP=$(pub_ip)
-  read -rp "Enter FOREIGN server public IP [${FOREIGN_IP:-none}]: " in_ip
-  FOREIGN_IP=${in_ip:-$FOREIGN_IP}
-  [[ -n "$FOREIGN_IP" ]] || die "Foreign IP is required."
+    create_service "$TNAME" "Iran-Server"
 
-  DEF_PORT=$(rnd 20000 60000)
-  read -rp "AmneziaWG UDP port [random: ${DEF_PORT}]: " AWG_PORT
-  AWG_PORT=${AWG_PORT:-$DEF_PORT}
-  read -rp "Tunnel MTU [1320]: " MTU; MTU=${MTU:-1320}
+    echo -e "\n${GREEN}========================================${NC}"
+    echo -e "${GREEN}Iran Server tunnel created successfully${NC}"
+    echo -e "${GREEN}========================================${NC}"
+    echo -e "Name         : ${YELLOW}$TNAME${NC}"
+    echo -e "Control Port : ${YELLOW}$CPORT${NC}"
+    echo -e "Public Ports : ${YELLOW}$PORTS${NC}"
+    echo -e "Token        : ${YELLOW}$TOKEN${NC}"
+    echo -e "\n${CYAN}Use this Token and Control Port on the Foreign server.${NC}"
+}
 
-  gen_profile
-  PRIV=$(awg genkey); FR_PUB=$(echo "$PRIV" | awg pubkey); PSK=$(awg genpsk)
-  SELF_ADDR="$FR_ADDR"; IR_PUB=""
-  write_foreign_cfg "$NIC"
-  {
-    echo "ROLE=foreign"; echo "NIC=${NIC}"; echo "PORT=${AWG_PORT}"; echo "MTU=${MTU}"
-    echo "PSK=${PSK}"
-    echo "TOKEN=$(encode_token)"
-  } > "$META"; chmod 600 "$META"
-  bring_up
+# ------------------ Foreign Client ------------------
+setup_foreign() {
+    echo -e "\n${YELLOW}${BOLD}=== Setup Foreign Client ===${NC}\n"
 
-  echo
-  ok "Foreign server configured with v4.3 Advanced Padding."
-  echo "${YELLOW}${BOLD}Copy this ONE token and paste it on the Iran server (option 1):${RESET}"
-  echo "${CYAN}$(encode_token)${RESET}"
-  echo
-  ;;
+    read -p "Tunnel name [main]: " TNAME
+    TNAME=${TNAME:-main}
 
-1)
-  install_tools; setup_backend; sysctl_tuning
-  NIC=$(main_iface); [[ -n "$NIC" ]] || die "Cannot detect default network interface."
-  echo "Paste the token printed by the FOREIGN server:"
-  read -rp "> " TOKEN
-  decode_token "$TOKEN"
-  read -rp "Tunnel MTU [1320]: " MTU; MTU=${MTU:-1320}
-  read -rp "TCP ports to KEEP on this Iran server [${KEEP_TCP_PORTS}]: " kp
-  KEEP_TCP_PORTS=${kp:-$KEEP_TCP_PORTS}
+    read -p "Iran server IP: " SIP
+    if [ -z "$SIP" ]; then
+        echo -e "${RED}Iran server IP is required.${NC}"
+        return
+    fi
 
-  PRIV=$(awg genkey); IR_PUB=$(echo "$PRIV" | awg pubkey)
-  SELF_ADDR="$IR_ADDR"
-  write_iran_cfg "$NIC"
-  { echo "ROLE=iran"; echo "NIC=${NIC}"; echo "PORT=${AWG_PORT}"; echo "MTU=${MTU}"; } > "$META"
-  chmod 600 "$META"
-  bring_up
+    read -p "Control port [2333]: " CPORT
+    CPORT=${CPORT:-2333}
 
-  echo
-  ok "Iran server configured."
-  echo "${YELLOW}${BOLD}Iran public key -> paste it on the FOREIGN server (option 3):${RESET}"
-  echo "${CYAN}${IR_PUB}${RESET}"
-  echo
-  wait_handshake || true
-  ;;
+    read -p "Token: " TOKEN
+    if [ -z "$TOKEN" ]; then
+        echo -e "${RED}Token is required.${NC}"
+        return
+    fi
 
-3)
-  [[ -f "$CFG" ]] || die "No config at ${CFG}. Run option 2 first."
-  read -rp "Enter IRAN server public key: " IR_PUB
-  [[ -n "$IR_PUB" ]] || die "Key is required."
-  PSK_LINE=$(sed -n 's/^PSK=//p' "$META" 2>/dev/null | head -n1)
-  [[ -n "$PSK_LINE" ]] || PSK_LINE=$(awk '/^PresharedKey/{print $3; exit}' "$CFG")
-  [[ -n "$PSK_LINE" ]] || die "Could not recover PresharedKey."
-  
-  awk '/^\[Peer\]/{exit} {print}' "$CFG" > "${CFG}.new"
-  cat >> "${CFG}.new" <<EOF
+    read -p "Local ports (comma separated, e.g. 443,80,2053,2083,2087): " PORTS
+    if [ -z "$PORTS" ]; then
+        echo -e "${RED}At least one port is required.${NC}"
+        return
+    fi
 
-[Peer]
-PublicKey = ${IR_PUB}
-PresharedKey = ${PSK_LINE}
-AllowedIPs = ${IR_ADDR}/32
-PersistentKeepalive = 25
+    SERVICES="{"
+    FIRST=1
+    IFS=',' read -ra PARR <<< "$PORTS"
+    for P in "${PARR[@]}"; do
+        P=$(echo "$P" | xargs)
+        [ -z "$P" ] && continue
+        if [ $FIRST -eq 0 ]; then
+            SERVICES+=","
+        fi
+        SERVICES+="\"$P\":\"127.0.0.1:$P\""
+        FIRST=0
+    done
+    SERVICES+="}"
+
+    cat > "$CONFIG_DIR/${TNAME}.json" <<EOF
+{
+  "mode": "client",
+  "server_addr": "$SIP:$CPORT",
+  "token": "$TOKEN",
+  "services": $SERVICES
+}
 EOF
-  mv "${CFG}.new" "$CFG"; chmod 600 "$CFG"
-  set -a; . /etc/default/amneziawg 2>/dev/null || true; set +a
-  awg-quick down "$IFACE" >/dev/null 2>&1 || true
-  awg-quick up "$IFACE" || die "Restart failed."
-  ok "Iran peer added successfully."
-  ;;
 
-4)
-  awg show "$IFACE" 2>/dev/null || echo "No device active."
-  ;;
+    create_service "$TNAME" "Foreign-Client"
 
-5)
-  systemctl disable --now "awg-quick@${IFACE}" >/dev/null 2>&1 || true
-  awg-quick down "$IFACE" >/dev/null 2>&1 || true
-  rm -rf "$CFG_DIR" /etc/sysctl.d/99-awg.conf /etc/modules-load.d/amneziawg.conf
-  ok "Cleaned up."
-  ;;
-*)
-  die "Invalid choice."
-  ;;
-esac
+    echo -e "\n${GREEN}========================================${NC}"
+    echo -e "${GREEN}Foreign Client tunnel created successfully${NC}"
+    echo -e "${GREEN}========================================${NC}"
+    echo -e "Name        : ${YELLOW}$TNAME${NC}"
+    echo -e "Connected to: ${YELLOW}$SIP:$CPORT${NC}"
+    echo -e "Local Ports : ${YELLOW}$PORTS${NC}"
+}
+
+# ------------------ Main Menu ------------------
+install_core
+
+while true; do
+    echo -e "\n${CYAN}${BOLD}============ MAIN MENU ============${NC}"
+    echo -e "  1) Setup Iran Server"
+    echo -e "  2) Setup Foreign Client"
+    echo -e "  3) Delete Tunnel"
+    echo -e "  4) List Tunnels"
+    echo -e "  0) Exit"
+    echo -e "${CYAN}===================================${NC}"
+    read -p "Select option: " CHOICE
+
+    case $CHOICE in
+        1) setup_iran ;;
+        2) setup_foreign ;;
+        3) delete_tunnel ;;
+        4)
+            echo -e "\n${CYAN}Current tunnels:${NC}"
+            TUNNELS=($(list_tunnels))
+            if [ ${#TUNNELS[@]} -eq 0 ]; then
+                echo -e "${RED}No tunnels found.${NC}"
+            else
+                for T in "${TUNNELS[@]}"; do
+                    STATUS=$(systemctl is-active "${APP_NAME}-$T" 2>/dev/null || echo "inactive")
+                    if [ "$STATUS" == "active" ]; then
+                        echo -e "  - $T : ${GREEN}Running${NC}"
+                    else
+                        echo -e "  - $T : ${RED}Stopped${NC}"
+                    fi
+                done
+            fi
+            ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}Invalid option${NC}" ;;
+    esac
+done
