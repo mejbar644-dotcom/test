@@ -783,6 +783,7 @@ open_port() { # port [source-ip]
   if command -v ufw >/dev/null 2>&1 && [[ "$st" == *"Status: active"* ]]; then
     if [ -n "$src" ]; then ufw allow from "$src" to any port "$port" proto tcp >/dev/null
     else ufw allow "${port}/tcp" >/dev/null; fi
+    printf 'ufw %s %s\n' "$port" "${src:--}" >> "$CONF/.fw"
     ok "ufw: opened ${port}/tcp${src:+ for $src}"
   elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
     if [ -n "$src" ]; then
@@ -791,6 +792,7 @@ open_port() { # port [source-ip]
       firewall-cmd --permanent --add-port="${port}/tcp" >/dev/null
     fi
     firewall-cmd --reload >/dev/null
+    printf 'firewalld %s %s\n' "$port" "${src:--}" >> "$CONF/.fw"
     ok "firewalld: opened ${port}/tcp${src:+ for $src}"
   else
     warn "no active ufw/firewalld found. If you use iptables, open TCP ${port} yourself."
@@ -860,6 +862,8 @@ setup_server() {
     warn "an existing setup was found. Continuing creates NEW keys; old tokens will stop working."
     confirm "Continue?" || die "aborted"
     systemctl stop tunnel-server >/dev/null 2>&1 || true
+    close_ports
+    rm -f "$CONF/.fw"
   fi
 
   ask LISTEN_PORT "Tunnel port (443 looks like a normal website)" 443 valid_port
@@ -967,6 +971,28 @@ test_client() {
 }
 
 # ---------------------------------------------------------------- status / uninstall
+close_ports() { # remove firewall rules that this script added
+  [ -f "$CONF/.fw" ] || return 0
+  local fw port src
+  while read -r fw port src; do
+    [ -n "$fw" ] || continue
+    if [ "$src" = "-" ]; then src=""; fi
+    case "$fw" in
+      ufw)
+        if [ -n "$src" ]; then ufw delete allow from "$src" to any port "$port" proto tcp >/dev/null 2>&1 || true
+        else ufw delete allow "${port}/tcp" >/dev/null 2>&1 || true; fi
+        ok "ufw: removed rule for ${port}/tcp${src:+ ($src)}" ;;
+      firewalld)
+        if [ -n "$src" ]; then
+          firewall-cmd --permanent --remove-rich-rule="rule family=ipv4 source address=${src} port port=${port} protocol=tcp accept" >/dev/null 2>&1 || true
+        else
+          firewall-cmd --permanent --remove-port="${port}/tcp" >/dev/null 2>&1 || true
+        fi
+        firewall-cmd --reload >/dev/null 2>&1 || true
+        ok "firewalld: removed rule for ${port}/tcp${src:+ ($src)}" ;;
+    esac
+  done < "$CONF/.fw"
+}
 show_status() {
   local u found=0
   for u in tunnel-server tunnel-client; do
@@ -980,8 +1006,15 @@ show_status() {
 }
 
 uninstall_all() {
-  confirm "Remove tunnel, its services, keys and config from this server?" || die "aborted"
+  echo "This will remove from this server:"
+  echo "  - services tunnel-server / tunnel-client (stopped, disabled, unit files deleted)"
+  echo "  - $BIN and the build marker in $SHARE"
+  echo "  - $CONF (keys, certificates, pairing token, settings)"
+  echo "  - the 'tunnel' system user"
+  echo "  - firewall rules (ufw/firewalld) that this installer added"
+  confirm "Remove everything?" || die "aborted"
   local u
+  close_ports
   for u in tunnel-server tunnel-client; do
     systemctl disable --now "$u" >/dev/null 2>&1 || true
     rm -f "/etc/systemd/system/$u.service"
@@ -989,8 +1022,9 @@ uninstall_all() {
   systemctl daemon-reload
   rm -rf "$CONF" "$SHARE" "$BIN"
   userdel tunnel >/dev/null 2>&1 || true
-  ok "tunnel removed"
-  warn "firewall rules that were added are not removed automatically (ufw status numbered / firewall-cmd --list-all)."
+  ok "tunnel completely removed"
+  warn "if you opened the port in a cloud firewall / security group or iptables yourself, remove that rule manually."
+  echo "(Server A and B are independent: run the uninstall on the other server too.)"
 }
 
 # ---------------------------------------------------------------- main
@@ -1005,7 +1039,7 @@ main() {
   trap 'rm -rf "$TMP"' EXIT
 
   local choice="${ROLE:-}"
-  case "${choice,,}" in b|server) choice=1 ;; a|client) choice=2 ;; esac
+  case "${choice,,}" in b|server) choice=1 ;; a|client) choice=2 ;; uninstall|remove) choice=5 ;; esac
   if [ -z "$choice" ]; then
     [ "$HAVE_TTY" = 1 ] || die "no terminal available. Set ROLE=A or ROLE=B, or download the script and run: sudo bash install.sh"
     echo
@@ -1016,7 +1050,7 @@ main() {
     echo "   2) Server A  - entry point (runs the tunnel client)"
     echo "   3) Status"
     echo "   4) Show pairing token (on Server B)"
-    echo "   5) Uninstall"
+    echo "   5) Uninstall (remove everything)"
     echo "   0) Exit"
     echo
     read -r -p "Choose [1-5]: " choice </dev/tty || exit 1
