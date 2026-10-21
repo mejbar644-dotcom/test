@@ -5,7 +5,7 @@
 #  - Optional S3 & S4 Padding for AmneziaWG 2.0+ (live-tested)
 #  - Fully randomized profile & unique tokens on every run
 #  - Optimized for TCP traffic flow & Anti-DPI fingerprinting
-#  - TTL normalization, validated multiport forwarding
+#  - TTL normalization, continuous port-range forwarding
 # ============================================================
 
 set -uo pipefail
@@ -18,7 +18,7 @@ IR_ADDR="10.0.0.2"
 FR_ADDR="10.0.0.1"
 CIDR="30"
 KEEP_TCP_PORTS="22,10052"            # ports that must stay on the Iran server
-FORWARD_PORTS="80,443,2000:50000"    # ports/ranges forwarded to the Foreign server
+PORT_RANGE="80:60000"                # continuous TCP/UDP range forwarded to the Foreign server
 USE_S3S4="n"                         # AmneziaWG 2.0 S3/S4 padding (y/n)
 USERSPACE=0                          # set by setup_backend (1 = amneziawg-go)
 S3S4_CAP=""                          # cached result of the live S3/S4 test
@@ -79,6 +79,19 @@ validate_ports() { # validate_ports NAME VALUE
     fi
   done
   (( count <= 15 )) || die "${name} uses ${count} multiport entries (max 15; each range counts as 2)."
+}
+
+# Validate a single port or one continuous range (START:END)
+validate_port_range() { # validate_port_range NAME VALUE
+  local name=$1 val=$2 a b
+  if [[ "$val" =~ ^[0-9]+$ ]]; then
+    (( 10#$val >= 1 && 10#$val <= 65535 )) || die "${name}: port '${val}' is out of range (1-65535)."
+  elif [[ "$val" =~ ^([0-9]+):([0-9]+)$ ]]; then
+    a=$(( 10#${BASH_REMATCH[1]} )); b=$(( 10#${BASH_REMATCH[2]} ))
+    (( a >= 1 && b <= 65535 && a <= b )) || die "${name}: range '${val}' is invalid (use START:END within 1-65535)."
+  else
+    die "${name}: invalid value '${val}' (expected START:END, e.g. 80:60000)."
+  fi
 }
 
 # Live check: does the awg userland AND the active backend accept S3/S4?
@@ -285,8 +298,8 @@ PostUp = iptables -t nat -F AWG_DNAT
 PostUp = iptables -t nat -C PREROUTING -i ${NIC} -j AWG_DNAT 2>/dev/null || iptables -t nat -I PREROUTING 1 -i ${NIC} -j AWG_DNAT
 PostUp = iptables -t nat -A AWG_DNAT -p tcp -m multiport --dports ${KEEP_TCP_PORTS} -j RETURN
 PostUp = iptables -t nat -A AWG_DNAT -p udp --dport ${AWG_PORT} -j RETURN
-PostUp = iptables -t nat -A AWG_DNAT -p tcp -m multiport --dports ${FORWARD_PORTS} -j DNAT --to-destination ${FR_ADDR}
-PostUp = iptables -t nat -A AWG_DNAT -p udp -m multiport --dports ${FORWARD_PORTS} -j DNAT --to-destination ${FR_ADDR}
+PostUp = iptables -t nat -A AWG_DNAT -p tcp --dport ${PORT_RANGE} -j DNAT --to-destination ${FR_ADDR}
+PostUp = iptables -t nat -A AWG_DNAT -p udp --dport ${PORT_RANGE} -j DNAT --to-destination ${FR_ADDR}
 PostUp = iptables -t nat -C POSTROUTING -o %i -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o %i -j MASQUERADE
 PostUp = iptables -C FORWARD -i ${NIC} -o %i -j ACCEPT 2>/dev/null || iptables -I FORWARD 1 -i ${NIC} -o %i -j ACCEPT
 PostUp = iptables -C FORWARD -i %i -o ${NIC} -j ACCEPT 2>/dev/null || iptables -I FORWARD 1 -i %i -o ${NIC} -j ACCEPT
@@ -459,14 +472,14 @@ case "$CHOICE" in
   read -rp "Tunnel MTU [1420]: " MTU; MTU=${MTU:-1420}
   read -rp "TCP ports to KEEP on this Iran server [${KEEP_TCP_PORTS}]: " kp
   KEEP_TCP_PORTS=${kp:-$KEEP_TCP_PORTS}
-  read -rp "TCP/UDP ports or ranges to FORWARD to Foreign server [${FORWARD_PORTS}]: " fp
-  FORWARD_PORTS=${fp:-$FORWARD_PORTS}
+  read -rp "TCP/UDP port range to FORWARD to Foreign server [${PORT_RANGE}]: " pr
+  PORT_RANGE=${pr:-$PORT_RANGE}
 
-  # Strip spaces and validate multiport lists (max 15 entries, range = 2)
+  # Strip spaces and validate (KEEP list: max 15 multiport entries; forward: one range)
   KEEP_TCP_PORTS=${KEEP_TCP_PORTS// /}
-  FORWARD_PORTS=${FORWARD_PORTS// /}
+  PORT_RANGE=${PORT_RANGE// /}
   validate_ports "KEEP_TCP_PORTS" "$KEEP_TCP_PORTS"
-  validate_ports "FORWARD_PORTS" "$FORWARD_PORTS"
+  validate_port_range "PORT_RANGE" "$PORT_RANGE"
 
   if [[ "$USE_S3S4" == "y" ]] && ! supports_s3_s4; then
     die "Token enables S3/S4 but this server's awg backend does not support it. Re-run option 2 on the foreign server with S3/S4 disabled (or upgrade amneziawg)."
@@ -476,7 +489,7 @@ case "$CHOICE" in
   SELF_ADDR="$IR_ADDR"
   write_iran_cfg "$NIC"
   { echo "ROLE=iran"; echo "NIC=${NIC}"; echo "PORT=${AWG_PORT}"; echo "MTU=${MTU}"
-    echo "USE_S3S4=${USE_S3S4}"; echo "KEEP_TCP_PORTS=${KEEP_TCP_PORTS}"; echo "FORWARD_PORTS=${FORWARD_PORTS}"; } > "$META"
+    echo "USE_S3S4=${USE_S3S4}"; echo "KEEP_TCP_PORTS=${KEEP_TCP_PORTS}"; echo "PORT_RANGE=${PORT_RANGE}"; } > "$META"
   chmod 600 "$META"
   bring_up
 
